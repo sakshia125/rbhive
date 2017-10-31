@@ -490,7 +490,7 @@ module Hive
         EX = 1
 
         FIELDS = {
-          SUCCESS => {:type => ::Thrift::Types::STRUCT, :name => 'success', :class => ::Hive::Thrift::QueryPlan},
+          SUCCESS => {:type => ::Thrift::Types::STRUCT, :name => 'success', :class => ::QueryPlan},
           EX => {:type => ::Thrift::Types::STRUCT, :name => 'ex', :class => ::Hive::Thrift::HiveServerException}
         }
 

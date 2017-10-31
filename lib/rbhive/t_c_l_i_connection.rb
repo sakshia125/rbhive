@@ -8,7 +8,9 @@ raise 'RBHive is not loaded' unless defined?(RBHive)
 require File.join(File.dirname(__FILE__), *%w[.. thrift t_c_l_i_service_constants])
 require File.join(File.dirname(__FILE__), *%w[.. thrift t_c_l_i_service])
 require File.join(File.dirname(__FILE__), *%w[.. thrift sasl_client_transport])
-
+require 'net/ssh/proxy/socks5'
+require 'socket'
+require 'socksify'
 # restore warnings
 $VERBOSE = old_verbose
 
@@ -29,6 +31,33 @@ module Thrift
   end
 end
 
+module Thrift
+  class Socket < BaseTransport
+    def open
+	  puts "I am opening this."
+      for addrinfo in ::Socket::getaddrinfo(@server, @port, nil, ::Socket::SOCK_STREAM) do
+        begin
+		  puts addrinfo
+		  puts "THIS is server:  #{addrinfo[3]}"
+		  puts "this is port: #{addrinfo[1]}"
+		  TCPSocket::socks_server = "172.18.100.243"
+          TCPSocket::socks_port = 1080
+		  socket = TCPSocket.new(addrinfo[3], addrinfo[1])
+          #socket = ::Socket.new(addrinfo[4], ::Socket::SOCK_STREAM, 0)
+		  #socket.socks_server('172.18.100.243')
+		  #socket.socks_port(1080)
+          socket.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, 1)
+          sockaddr = ::Socket.sockaddr_in(addrinfo[1], addrinfo[3])
+          return @handle = socket
+        rescue StandardError => e
+          next
+        end
+      end
+      raise TransportException.new(TransportException::NOT_OPEN, "Could not connect to #{@desc}: #{e}")
+    end
+  end
+end
+
 module RBHive
   
   HIVE_THRIFT_MAPPING = {
@@ -44,8 +73,13 @@ module RBHive
     :PROTOCOL_V4 => 3,
     :PROTOCOL_V5 => 4,
     :PROTOCOL_V6 => 5,
-    :PROTOCOL_V7 => 6
-  }
+    :PROTOCOL_V7 => 6,
+    :PROTOCOL_V8 => 7,
+    :PROTOCOL_V9 => 8,
+    :PROTOCOL_V10 => 9,
+    :PROTOCOL_V11 => 10
+	
+	}
 
   def tcli_connect(server, port = 10_000, options)
     logger = options.key?(:logger) ? options.delete(:logger) : StdOutLogger.new
@@ -91,18 +125,23 @@ module RBHive
       
       # Defaults to buffered transport, Hive 0.10, 1800 second timeout
       options[:transport]     ||= :buffered
-      options[:hive_version]  ||= 10
+      options[:hive_version]  ||= :PROTOCOL_V10
       options[:timeout]       ||= 1800
       @options = options
       
       # Look up the appropriate Thrift protocol version for the supplied Hive version
       @thrift_protocol_version = thrift_hive_protocol(options[:hive_version])
-      
+      #@thrift_protocol_version = -5;
+	  #logger2 = StdOutLogger.new
+	  #logger2.set('level', 'debug');
       @logger = logger
       @transport = thrift_transport(server, port)
+	  puts @transport
       @protocol = Thrift::BinaryProtocol.new(@transport)
-      @client = Hive2::Thrift::TCLIService::Client.new(@protocol)
-      @session = nil
+	  puts @protocol
+      @client = TCLIService::Client.new(@protocol)
+      puts @client
+	  @session = nil
       @logger.info("Connecting to HiveServer2 #{server} on port #{port}")
     end
     
@@ -119,15 +158,19 @@ module RBHive
         return Thrift::SaslClientTransport.new(thrift_socket(server, port, @options[:timeout]),
                                                parse_sasl_params(@options[:sasl_params]))
       when :http
-        return Thrift::HTTPClientTransport.new("http://#{server}:#{port}/cliservice")
+	    return Thrift::HTTPClientTransport.new("http://#{server}:#{port}/cliservice")
       else
         raise "Unrecognised transport type '#{transport}'"
       end
     end
 
     def thrift_socket(server, port, timeout)
-      socket = Thrift::Socket.new(server, port)
-      socket.timeout = timeout
+	  #proxy = Net::SSH::Proxy::SOCKS5.new('172.18.100.243', 1080,:user => 'sakshi')	
+	  #socket = proxy.open(server, port, :timeout => timeout)
+	  socket = Thrift::Socket.new(server, port)
+      #TCPSocket::socks_server = "172.18.100.243"
+      #TCPSocket::socks_port = 1080
+      #socket = TCPSocket.new("127.0.0.1", 10000)
       socket
     end
 
@@ -152,6 +195,7 @@ module RBHive
     end
 
     def open_session
+	  puts "Let's talk protocol :  #{@thrift_protocol_version}."
       @session = @client.OpenSession(prepare_open_session(@thrift_protocol_version))
     end
 
@@ -375,27 +419,27 @@ module RBHive
     private
 
     def prepare_open_session(client_protocol)
-      req = ::Hive2::Thrift::TOpenSessionReq.new( @options[:sasl_params].nil? ? [] : @options[:sasl_params] )
+      req = ::TOpenSessionReq.new( @options[:sasl_params].nil? ? [] : @options[:sasl_params] )
       req.client_protocol = client_protocol
       req
     end
 
     def prepare_close_session
-      ::Hive2::Thrift::TCloseSessionReq.new( sessionHandle: self.session )
+      ::TCloseSessionReq.new( sessionHandle: self.session )
     end
 
     def prepare_execute_statement(query)
-      ::Hive2::Thrift::TExecuteStatementReq.new( sessionHandle: self.session, statement: query.to_s, confOverlay: {} )
+      ::TExecuteStatementReq.new( sessionHandle: self.session, statement: query.to_s, confOverlay: {} )
     end
 
     def prepare_fetch_results(handle, orientation=:first, rows=100)
       orientation_value = "FETCH_#{orientation.to_s.upcase}"
-      valid_orientations = ::Hive2::Thrift::TFetchOrientation::VALUE_MAP.values
+      valid_orientations = ::TFetchOrientation::VALUE_MAP.values
       unless valid_orientations.include?(orientation_value)
         raise ArgumentError, "Invalid orientation: #{orientation.inspect}"
       end
-      orientation_const = eval("::Hive2::Thrift::TFetchOrientation::#{orientation_value}")
-      ::Hive2::Thrift::TFetchResultsReq.new(
+      orientation_const = eval("::TFetchOrientation::#{orientation_value}")
+      ::TFetchResultsReq.new(
         operationHandle: handle,
         orientation: orientation_const,
         maxRows: rows
@@ -424,7 +468,7 @@ module RBHive
     end
 
     def get_schema_for(handle)
-      req = ::Hive2::Thrift::TGetResultSetMetadataReq.new( operationHandle: handle )
+      req = ::TGetResultSetMetadataReq.new( operationHandle: handle )
       metadata = client.GetResultSetMetadata( req )
       metadata.schema
     end
